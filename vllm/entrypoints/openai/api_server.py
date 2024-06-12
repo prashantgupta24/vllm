@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import importlib
 import inspect
@@ -17,7 +18,7 @@ from starlette.routing import Mount
 
 import vllm
 import vllm.envs as envs
-from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
@@ -35,6 +36,8 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds
 openai_serving_chat: OpenAIServingChat
 openai_serving_completion: OpenAIServingCompletion
 openai_serving_embedding: OpenAIServingEmbedding
+llm_engine: AsyncLLMEngine
+engine_args: EngineArgs
 
 logger = init_logger('vllm.entrypoints.openai.api_server')
 
@@ -47,7 +50,7 @@ async def lifespan(app: fastapi.FastAPI):
     async def _force_log():
         while True:
             await asyncio.sleep(10)
-            await engine.do_log_stats()
+            await llm_engine.do_log_stats()
 
     if not engine_args.disable_log_stats:
         task = asyncio.create_task(_force_log())
@@ -138,9 +141,88 @@ async def create_embedding(request: EmbeddingRequest, raw_request: Request):
         return JSONResponse(content=generator.model_dump())
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(args: Optional[argparse.Namespace] = None,
+         engine: Optional[AsyncLLMEngine] = None):
+    """Main function that sets up and runs vllm."""
 
+    args = args if args else parse_args()
+
+    set_middleware(args)
+
+    logger.info("vLLM API server version %s", vllm.__version__)
+    logger.info("args: %s", args)
+
+    if args.served_model_name is not None:
+        served_model_names = args.served_model_name
+    else:
+        served_model_names = [args.model]
+
+    global engine_args
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+
+    # Enforce pixel values as image input type for vision language models
+    # when serving with API server
+    if engine_args.image_input_type is not None and \
+        engine_args.image_input_type.upper() != "PIXEL_VALUES":
+        raise ValueError(
+            f"Invalid image_input_type: {engine_args.image_input_type}. "
+            "Only --image-input-type 'pixel_values' is supported for serving "
+            "vision language models with the vLLM API server.")
+
+    global llm_engine
+    llm_engine = engine if engine else initialize_engine(engine_args)
+
+    event_loop: Optional[asyncio.AbstractEventLoop]
+    try:
+        event_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        event_loop = None
+
+    if event_loop is not None and event_loop.is_running():
+        # If the current is instanced by Ray Serve,
+        # there is already a running event loop
+        model_config = event_loop.run_until_complete(
+            llm_engine.get_model_config())
+    else:
+        # When using single vLLM without engine_use_ray
+        model_config = asyncio.run(llm_engine.get_model_config())
+
+    global openai_serving_chat
+    global openai_serving_completion
+    global openai_serving_embedding
+
+    openai_serving_chat = OpenAIServingChat(
+        llm_engine,
+        model_config,
+        served_model_names,
+        args.response_role,
+        args.lora_modules,
+        args.chat_template,
+    )
+    openai_serving_completion = OpenAIServingCompletion(
+        llm_engine, model_config, served_model_names, args.lora_modules)
+    openai_serving_embedding = OpenAIServingEmbedding(llm_engine, model_config,
+                                                      served_model_names)
+    app.root_path = args.root_path
+    uvicorn.run(app,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs)
+
+
+def initialize_engine(engine_args: EngineArgs) -> AsyncLLMEngine:
+    """Initialize the LLMEngine from the command line arguments."""
+    engine: AsyncLLMEngine = AsyncLLMEngine.from_engine_args(
+        engine_args, usage_context=UsageContext.OPENAI_API_SERVER)
+    return engine
+
+
+def set_middleware(args) -> None:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=args.allowed_origins,
@@ -174,58 +256,6 @@ if __name__ == "__main__":
             raise ValueError(f"Invalid middleware {middleware}. "
                              f"Must be a function or a class.")
 
-    logger.info("vLLM API server version %s", vllm.__version__)
-    logger.info("args: %s", args)
 
-    if args.served_model_name is not None:
-        served_model_names = args.served_model_name
-    else:
-        served_model_names = [args.model]
-
-    engine_args = AsyncEngineArgs.from_cli_args(args)
-
-    # Enforce pixel values as image input type for vision language models
-    # when serving with API server
-    if engine_args.image_input_type is not None and \
-        engine_args.image_input_type.upper() != "PIXEL_VALUES":
-        raise ValueError(
-            f"Invalid image_input_type: {engine_args.image_input_type}. "
-            "Only --image-input-type 'pixel_values' is supported for serving "
-            "vision language models with the vLLM API server.")
-
-    engine = AsyncLLMEngine.from_engine_args(
-        engine_args, usage_context=UsageContext.OPENAI_API_SERVER)
-
-    event_loop: Optional[asyncio.AbstractEventLoop]
-    try:
-        event_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        event_loop = None
-
-    if event_loop is not None and event_loop.is_running():
-        # If the current is instanced by Ray Serve,
-        # there is already a running event loop
-        model_config = event_loop.run_until_complete(engine.get_model_config())
-    else:
-        # When using single vLLM without engine_use_ray
-        model_config = asyncio.run(engine.get_model_config())
-
-    openai_serving_chat = OpenAIServingChat(engine, model_config,
-                                            served_model_names,
-                                            args.response_role,
-                                            args.lora_modules,
-                                            args.chat_template)
-    openai_serving_completion = OpenAIServingCompletion(
-        engine, model_config, served_model_names, args.lora_modules)
-    openai_serving_embedding = OpenAIServingEmbedding(engine, model_config,
-                                                      served_model_names)
-    app.root_path = args.root_path
-    uvicorn.run(app,
-                host=args.host,
-                port=args.port,
-                log_level=args.uvicorn_log_level,
-                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-                ssl_keyfile=args.ssl_keyfile,
-                ssl_certfile=args.ssl_certfile,
-                ssl_ca_certs=args.ssl_ca_certs,
-                ssl_cert_reqs=args.ssl_cert_reqs)
+if __name__ == "__main__":
+    main()
